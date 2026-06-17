@@ -1,0 +1,14 @@
+<?xml version="1.0" encoding="utf-8"?>
+<shortcuts xmlns:android="http://schemas.android.com/apk/res/android">
+    <shortcut
+        android:shortcutId="debug"
+        android:enabled="true"
+        android:shortcutShortLabel="@string/debug_short_label"
+        android:shortcutLongLabel="@string/debug_long_label">
+        <intent
+            android:action="android.intent.action.VIEW"
+            android:targetPackage="com.connor.pendant"
+            android:targetClass="com.connor.pendant.DebugActivity" />
+        <categories android:name="android.shortcut.conversation" />
+    </shortcut>
+</shortcuts>

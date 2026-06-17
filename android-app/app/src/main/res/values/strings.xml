@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">Pendant</string>
+    <string name="debug_short_label">Debug</string>
+    <string name="debug_long_label">Pendant debug surface</string>
+</resources>

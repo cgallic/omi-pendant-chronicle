@@ -1,0 +1,30 @@
+# Secrets / local config — never commit
+**/local.properties
+**/.env
+*.env.*
+
+# Build artifacts
+**/build/
+**/.gradle/
+**/.kotlin/
+*.apk
+*.aab
+*.keystore
+
+# Python
+**/.venv/
+**/__pycache__/
+*.pyc
+**/*.egg-info/
+**/dist/
+
+# Editor / OS
+.idea/
+.vscode/
+*.iml
+.DS_Store
+
+# Captured media / scratch
+_tmp/
+*.opusraw
+*.wav

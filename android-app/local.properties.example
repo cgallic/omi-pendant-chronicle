@@ -1,0 +1,17 @@
+# Copy this file to `local.properties` and fill in your own values.
+# `local.properties` is gitignored and read at build time — never commit it.
+
+# Path to your Android SDK
+sdk.dir=/path/to/android-sdk
+
+# Backend raw-ingest URL (port 8773). The app derives the dashboard/API base
+# from the same host on port 8772.
+agent.url=http://YOUR_AGENT_HOST:8773/raw
+
+# Audio-out WebSocket URL (port 8774), used in live/translate mode.
+audio.out.url=ws://YOUR_AGENT_HOST:8774/ws
+
+# Shared secret sent as the X-Pendant-Secret header. Must match the
+# PENDANT_SECRET your backend raw sink validates against.
+# Generate one with: openssl rand -hex 16
+pendant.secret=your-32-hex-shared-secret
