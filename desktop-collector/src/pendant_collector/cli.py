@@ -29,6 +29,8 @@ def build_parser() -> argparse.ArgumentParser:
     sync.add_argument("--scan-timeout", type=float, default=20.0)
     sync.add_argument("--connect-timeout", type=float, default=45.0)
     sync.add_argument("--stall-timeout", type=float, default=30.0)
+    sync.add_argument("--storage-ready-timeout", type=float, default=90.0,
+                      help="how long to wait for the SD/LittleFS boot scan (large backlog needs more)")
     sync.add_argument("--once", action="store_true", help="sync one file then exit")
     sync.add_argument("--max-files", type=int, default=None)
     sync.add_argument("--dry-run-delete", action="store_true", help="upload but do not delete pendant files")
@@ -85,6 +87,7 @@ async def async_main(argv: list[str]) -> int:
             scan_timeout_s=args.scan_timeout,
             connect_timeout_s=args.connect_timeout,
             stall_timeout_s=args.stall_timeout,
+            storage_ready_timeout_s=args.storage_ready_timeout,
             dry_run_delete=args.dry_run_delete,
         )
         await collector.sync(once=args.once, max_files=args.max_files)

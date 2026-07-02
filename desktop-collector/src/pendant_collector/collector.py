@@ -72,6 +72,7 @@ class OmiDesktopCollector:
         scan_timeout_s: float = 20.0,
         connect_timeout_s: float = 45.0,
         stall_timeout_s: float = 30.0,
+        storage_ready_timeout_s: float = 90.0,
         dry_run_delete: bool = False,
     ) -> None:
         self.agent_url = agent_url
@@ -80,6 +81,7 @@ class OmiDesktopCollector:
         self.scan_timeout_s = scan_timeout_s
         self.connect_timeout_s = connect_timeout_s
         self.stall_timeout_s = stall_timeout_s
+        self.storage_ready_timeout_s = storage_ready_timeout_s
         self.dry_run_delete = dry_run_delete
         self._notify_queue: asyncio.Queue[bytes] = asyncio.Queue()
         self._seq = 0
@@ -157,35 +159,68 @@ class OmiDesktopCollector:
             try:
                 synced = 0
                 while max_files is None or synced < max_files:
+                    # One LIST per batch, not one per file. LIST is a firmware
+                    # directory scan that can trigger a 10-50s full-filesystem
+                    # traversal when LittleFS's allocation window is exhausted
+                    # (sd_card.c:68-76); re-listing before every file paid that
+                    # stall repeatedly and is what made sync feel like it "reads
+                    # all the files before it starts".
                     files = await self.list_files(client)
                     if not files:
                         LOG.info("storage empty; sync complete")
                         return
 
-                    LOG.info("listed %d files; first size=%s ts=%s", len(files), files[0].size, files[0].timestamp)
-                    target = files[0]
-                    raw_bytes = await self.read_file(client, target)
-                    frames = self.build_storage_frames(raw_bytes)
-                    if not frames and target.size > 0:
-                        raise StorageProtocolError(f"file produced no frames index={target.index} size={target.size}")
+                    LOG.info(
+                        "listed %d files in batch; draining oldest-first without re-listing (first size=%s ts=%s)",
+                        len(files),
+                        files[0].size,
+                        files[0].timestamp,
+                    )
+                    for target in files:
+                        # After each delete the pendant re-indexes, so the oldest
+                        # undrained file is always index 0. Walk our cached
+                        # metadata for timestamps but read/delete index 0. In
+                        # dry-run we never delete, so nothing shifts and we must
+                        # read each file at its original index instead.
+                        read_index = target.index if self.dry_run_delete else 0
+                        raw_bytes = await self.read_file(client, target, index=read_index)
+                        frames = self.build_storage_frames(raw_bytes)
+                        if not frames and target.size > 0:
+                            raise StorageProtocolError(
+                                f"file produced no frames index={read_index} size={target.size}"
+                            )
 
-                    LOG.info("file safe index=%s size=%s frames=%s", target.index, target.size, len(frames))
-                    result = await self.uploader.post_frames(frames, started_at_ms=target.started_at_ms)
-                    if not result.ok:
-                        raise StorageProtocolError(
-                            f"upload failed after {result.frames} frames status={result.status_code} error={result.error}"
-                        )
+                        LOG.info("file safe index=%s size=%s frames=%s", read_index, target.size, len(frames))
+                        result = await self.uploader.post_frames(frames, started_at_ms=target.started_at_ms)
+                        if not result.ok:
+                            raise StorageProtocolError(
+                                f"upload failed after {result.frames} frames status={result.status_code} error={result.error}"
+                            )
 
-                    LOG.info("uploaded index=%s frames=%s; deleting pendant file", target.index, result.frames)
+                        if self.dry_run_delete:
+                            LOG.warning("dry-run delete: leaving pendant file index=%s in place", target.index)
+                        else:
+                            LOG.info("uploaded frames=%s; deleting pendant index 0", result.frames)
+                            await self.delete_file(client, target, index=0)
+                        synced += 1
+                        if once or (max_files is not None and synced >= max_files):
+                            return
+
                     if self.dry_run_delete:
-                        LOG.warning("dry-run delete: leaving pendant file index=%s in place", target.index)
-                    else:
-                        await self.delete_file(client, target)
-                    synced += 1
-                    if once:
+                        # Nothing was deleted, so a re-LIST would return the same
+                        # batch forever. One pass is all dry-run can do.
+                        LOG.info("dry-run: drained one batch of %d files; stopping", len(files))
                         return
             finally:
-                await client.stop_notify(uuids.STORAGE_WRITE_CHAR)
+                # Don't let a cleanup call mask the real failure: if the pendant
+                # dropped the link (e.g. its storage worker jammed in an allocator
+                # traversal and starved the BLE stack), stop_notify raises
+                # "Not connected" and hides the underlying disconnect.
+                try:
+                    if client.is_connected:
+                        await client.stop_notify(uuids.STORAGE_WRITE_CHAR)
+                except Exception as exc:
+                    LOG.info("stop_notify skipped (link already down): %s", exc)
 
     async def _resolve_device(self) -> BLEDevice | str:
         return await self.scan_first(self.address)
@@ -261,83 +296,160 @@ class OmiDesktopCollector:
         return await asyncio.wait_for(self._notify_queue.get(), timeout=timeout_s)
 
     async def list_files(self, client: BleakClient) -> list[StorageFile]:
-        self._drain_notifications()
-        await self._write_storage_command(client, bytes([CMD_LIST_FILES]))
+        # The pendant returns STORAGE_NOT_READY(9) while its SD/LittleFS is still
+        # coming up after boot/wake — the firmware maps -EBUSY/-EAGAIN/-ETIMEDOUT
+        # to code 9 (storage.c storage_status_from_error) while the boot file-cache
+        # scan is running. That is transient, so re-issue LIST with backoff until
+        # the SD is ready instead of treating it as a fatal error.
+        deadline = time.monotonic() + self.storage_ready_timeout_s
+        attempt = 0
         while True:
-            data = await self._next_notify(self.stall_timeout_s)
-            if not data:
-                continue
-            if len(data) == 1:
-                status = data[0]
-                if status == STORAGE_OK:
-                    continue
-                if status == 0:
-                    return []
-                raise StorageProtocolError(f"list status {status_label(status)}")
-            count = data[0]
-            files: list[StorageFile] = []
-            offset = 1
-            for index in range(count):
-                if offset + 8 > len(data):
-                    break
-                timestamp = int.from_bytes(data[offset:offset + 4], "big")
-                size = int.from_bytes(data[offset + 4:offset + 8], "big")
-                files.append(StorageFile(index=index, timestamp=timestamp, size=size))
-                offset += 8
-            return estimate_timestamps(files)
-
-    async def read_file(self, client: BleakClient, file: StorageFile) -> bytes:
-        self._drain_notifications()
-        cmd = bytes([CMD_READ_FILE, file.index, 0, 0, 0, 0])
-        await self._write_storage_command(client, cmd)
-
-        buf = bytearray()
-        last_log = 0
-        started = time.monotonic()
-        LOG.info("reading index=%s ts=%s size=%s", file.index, file.timestamp, file.size)
-        while True:
-            try:
+            self._drain_notifications()
+            await self._write_storage_command(client, bytes([CMD_LIST_FILES]))
+            not_ready = False
+            while True:
                 data = await self._next_notify(self.stall_timeout_s)
-            except asyncio.TimeoutError as exc:
-                raise StorageProtocolError(
-                    f"read stalled index={file.index} bytes={len(buf)}/{file.size}"
-                ) from exc
-
-            if len(data) == 1:
-                status = data[0]
-                if status == STORAGE_OK:
+                if not data:
                     continue
-                if status == STORAGE_DONE:
-                    elapsed = max(time.monotonic() - started, 0.001)
-                    LOG.info(
-                        "read complete index=%s bytes=%s/%s rate=%.1f KB/s",
-                        file.index,
-                        len(buf),
-                        file.size,
-                        (len(buf) / 1024.0) / elapsed,
+                if len(data) == 1:
+                    status = data[0]
+                    if status == STORAGE_OK:
+                        continue
+                    if status == STORAGE_NOT_READY:
+                        not_ready = True
+                        break
+                    raise StorageProtocolError(f"list status {status_label(status)}")
+                count = data[0]
+                files: list[StorageFile] = []
+                offset = 1
+                for index in range(count):
+                    if offset + 8 > len(data):
+                        break
+                    timestamp = int.from_bytes(data[offset:offset + 4], "big")
+                    size = int.from_bytes(data[offset + 4:offset + 8], "big")
+                    files.append(StorageFile(index=index, timestamp=timestamp, size=size))
+                    offset += 8
+                return estimate_timestamps(files)
+
+            if not_ready:
+                if time.monotonic() >= deadline:
+                    raise StorageProtocolError(
+                        f"storage not ready after {self.storage_ready_timeout_s:.0f}s "
+                        "(SD still initializing — retry once the pendant has settled)"
                     )
-                    return bytes(buf)
-                raise StorageProtocolError(f"read status {status_label(status)} index={file.index}")
+                attempt += 1
+                wait = min(3.0, 1.0 + 0.5 * attempt)
+                LOG.info(
+                    "storage not ready (SD initializing); retrying LIST in %.1fs (attempt %d)",
+                    wait,
+                    attempt,
+                )
+                await asyncio.sleep(wait)
 
-            if len(data) <= STORAGE_TIMESTAMP_BYTES:
-                continue
-            buf.extend(data[STORAGE_TIMESTAMP_BYTES:])
-            if len(buf) - last_log >= PROGRESS_LOG_BYTES or len(buf) >= file.size:
-                last_log = len(buf)
-                LOG.info("read progress index=%s bytes=%s/%s", file.index, len(buf), file.size)
-
-    async def delete_file(self, client: BleakClient, file: StorageFile) -> None:
-        self._drain_notifications()
-        await self._write_storage_command(client, bytes([CMD_DELETE_FILE, file.index]))
+    async def read_file(self, client: BleakClient, file: StorageFile, *, index: int | None = None) -> bytes:
+        read_index = file.index if index is None else index
+        # Like LIST, the READ setup can return STORAGE_NOT_READY(9) while the SD is
+        # busy (full-FS traversal on a large backlog). Retry the whole read while no
+        # bytes have arrived yet; a NOT_READY *after* data has started is a real error.
+        deadline = time.monotonic() + self.storage_ready_timeout_s
+        attempt = 0
         while True:
-            data = await self._next_notify(self.stall_timeout_s)
-            if len(data) != 1:
-                continue
-            status = data[0]
-            if status in (STORAGE_OK, FILE_NOT_FOUND):
-                LOG.info("deleted index=%s status=%s", file.index, status_label(status))
-                return
-            raise StorageProtocolError(f"delete status {status_label(status)} index={file.index}")
+            self._drain_notifications()
+            cmd = bytes([CMD_READ_FILE, read_index, 0, 0, 0, 0])
+            await self._write_storage_command(client, cmd)
+
+            buf = bytearray()
+            last_log = 0
+            started = time.monotonic()
+            LOG.info("reading index=%s ts=%s size=%s", read_index, file.timestamp, file.size)
+            not_ready = False
+            while True:
+                try:
+                    data = await self._next_notify(self.stall_timeout_s)
+                except asyncio.TimeoutError as exc:
+                    raise StorageProtocolError(
+                        f"read stalled index={read_index} bytes={len(buf)}/{file.size}"
+                    ) from exc
+
+                if len(data) == 1:
+                    status = data[0]
+                    if status == STORAGE_OK:
+                        continue
+                    if status == STORAGE_DONE:
+                        elapsed = max(time.monotonic() - started, 0.001)
+                        LOG.info(
+                            "read complete index=%s bytes=%s/%s rate=%.1f KB/s",
+                            read_index,
+                            len(buf),
+                            file.size,
+                            (len(buf) / 1024.0) / elapsed,
+                        )
+                        return bytes(buf)
+                    if status == STORAGE_NOT_READY and not buf:
+                        not_ready = True
+                        break
+                    raise StorageProtocolError(f"read status {status_label(status)} index={read_index}")
+
+                if len(data) <= STORAGE_TIMESTAMP_BYTES:
+                    continue
+                buf.extend(data[STORAGE_TIMESTAMP_BYTES:])
+                if len(buf) - last_log >= PROGRESS_LOG_BYTES or len(buf) >= file.size:
+                    last_log = len(buf)
+                    LOG.info("read progress index=%s bytes=%s/%s", read_index, len(buf), file.size)
+
+            if not_ready:
+                if time.monotonic() >= deadline:
+                    raise StorageProtocolError(
+                        f"storage not ready for read index={read_index} after "
+                        f"{self.storage_ready_timeout_s:.0f}s"
+                    )
+                attempt += 1
+                # Back off LONG on read NOT_READY. The firmware serialises all SD
+                # work on one non-preemptible thread with a 60s read semaphore and a
+                # single read_in_flight latch (sd_card.c:1837). Fast (~3s) retries
+                # collide with that 60s window and keep re-arming the latch, so the
+                # read can never land. Wait long enough for the worker to finish its
+                # allocator traversal and clear the latch before asking again.
+                wait = min(45.0, 15.0 + 5.0 * attempt)
+                LOG.info(
+                    "read not ready (SD busy — worker in allocator scan); retrying READ in %.0fs (attempt %d)",
+                    wait,
+                    attempt,
+                )
+                await asyncio.sleep(wait)
+
+    async def delete_file(self, client: BleakClient, file: StorageFile, *, index: int | None = None) -> None:
+        del_index = file.index if index is None else index
+        # DELETE does a metadata write (lfs_remove + cache refresh) that can hit the
+        # transient allocator-busy state, same as LIST/READ — retry NOT_READY(9).
+        deadline = time.monotonic() + self.storage_ready_timeout_s
+        attempt = 0
+        while True:
+            self._drain_notifications()
+            await self._write_storage_command(client, bytes([CMD_DELETE_FILE, del_index]))
+            not_ready = False
+            while True:
+                data = await self._next_notify(self.stall_timeout_s)
+                if len(data) != 1:
+                    continue
+                status = data[0]
+                if status in (STORAGE_OK, FILE_NOT_FOUND):
+                    LOG.info("deleted index=%s status=%s", del_index, status_label(status))
+                    return
+                if status == STORAGE_NOT_READY:
+                    not_ready = True
+                    break
+                raise StorageProtocolError(f"delete status {status_label(status)} index={del_index}")
+            if not_ready:
+                if time.monotonic() >= deadline:
+                    raise StorageProtocolError(
+                        f"storage not ready for delete index={del_index} after "
+                        f"{self.storage_ready_timeout_s:.0f}s"
+                    )
+                attempt += 1
+                wait = min(10.0, 2.0 + 1.0 * attempt)
+                LOG.info("delete not ready (SD busy); retrying DELETE in %.0fs (attempt %d)", wait, attempt)
+                await asyncio.sleep(wait)
 
     def build_storage_frames(self, data: bytes) -> list[bytes]:
         frames: list[bytes] = []
