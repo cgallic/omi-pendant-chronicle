@@ -71,6 +71,26 @@ busy:
   central at a time — so keep the phone's Bluetooth off (or the app closed) while
   draining from the desktop.
 
+### Drain coordination (lease)
+
+So the desktop and phone don't drain at the same time (and re-upload each other's
+files), the collector holds a **lease** on the backend before draining, renews it
+between files, and releases it when done. If another client holds the lease, this
+pass is skipped. It's best-effort: if the backend has no lease endpoint or is
+unreachable, the collector proceeds anyway (`--no-lease` disables it explicitly;
+`--lease-holder` / `PENDANT_LEASE_HOLDER` sets the id, default `desktop-<hostname>`).
+
+The backend must expose three secret-gated endpoints (a single global TTL lease):
+
+```
+POST /lease/acquire?holder=<id>&ttl=<seconds>   -> {"granted": bool, "holder", "expires_in"}
+POST /lease/release?holder=<id>                 -> {"released": true}
+GET  /lease                                     -> {"held": bool, "holder", "expires_in"}
+```
+
+For the phone and desktop to actually coordinate, the Android app must honor the
+same lease.
+
 ### Large backlogs & firmware
 
 On a nearly-full SD card, LittleFS's block allocator repeatedly re-scans the
@@ -107,9 +127,9 @@ the same thing.
 
 ## Notes
 
-- Do not run this at the same time as the Android app until the server-side
-  collector lease endpoint exists. Two collectors can otherwise upload the same
-  pendant file before either deletes it.
+- Desktop and phone draining is coordinated by the backend **lease** (see *Drain
+  coordination* above) so they don't re-upload each other's files — provided both
+  clients honor it. Until the Android app does, still prefer one drainer at a time.
 - BLE storage reads are still serial. This improves coverage and computer-side
   availability; it does not make the pendant radio itself parallel.
 - A stronger Bluetooth adapter and closer physical placement can improve speed.

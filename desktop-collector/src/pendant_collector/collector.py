@@ -3,9 +3,11 @@ from __future__ import annotations
 import asyncio
 import logging
 import platform
+import socket
 import time
 from dataclasses import dataclass
 
+import httpx
 from bleak import BleakClient, BleakScanner
 from bleak.backends.device import BLEDevice
 
@@ -74,6 +76,8 @@ class OmiDesktopCollector:
         stall_timeout_s: float = 30.0,
         storage_ready_timeout_s: float = 90.0,
         dry_run_delete: bool = False,
+        lease_holder: str | None = None,
+        use_lease: bool = True,
     ) -> None:
         self.agent_url = agent_url
         self.secret = secret
@@ -83,6 +87,9 @@ class OmiDesktopCollector:
         self.stall_timeout_s = stall_timeout_s
         self.storage_ready_timeout_s = storage_ready_timeout_s
         self.dry_run_delete = dry_run_delete
+        self.use_lease = use_lease
+        self.lease_holder = lease_holder or f"desktop-{socket.gethostname()}"
+        self.lease_ttl_s = 600.0
         self._notify_queue: asyncio.Queue[bytes] = asyncio.Queue()
         self._seq = 0
         self.uploader = AgentUploader(agent_url, secret)
@@ -138,7 +145,68 @@ class OmiDesktopCollector:
         finally:
             await scanner.stop()
 
+    def _lease_base(self) -> str:
+        u = self.agent_url.rstrip("/")
+        return u[:-4] if u.endswith("/raw") else u
+
+    async def _lease_acquire(self) -> bool:
+        """Acquire/renew the drain lease so only one client drains at a time.
+
+        Returns True to proceed (granted, or the sink has no lease endpoint / is
+        unreachable — best-effort backward compatibility), False only when another
+        client explicitly holds the lease.
+        """
+        if not self.use_lease:
+            return True
+        url = self._lease_base() + "/lease/acquire"
+        try:
+            async with httpx.AsyncClient(timeout=8.0) as c:
+                r = await c.post(
+                    url,
+                    params={"holder": self.lease_holder, "ttl": self.lease_ttl_s},
+                    headers={"X-Pendant-Secret": self.secret},
+                )
+            if r.status_code == 404:
+                return True  # older sink without the lease endpoint → proceed
+            if r.status_code >= 300:
+                LOG.info("lease acquire http %s; proceeding best-effort", r.status_code)
+                return True
+            data = r.json()
+            if data.get("granted"):
+                return True
+            LOG.info(
+                "another client holds the drain lease (%s, %ss left); skipping this pass",
+                data.get("holder"), data.get("expires_in"),
+            )
+            return False
+        except Exception as exc:
+            LOG.info("lease endpoint unreachable (%s); proceeding best-effort", exc)
+            return True
+
+    async def _lease_release(self) -> None:
+        if not self.use_lease:
+            return
+        try:
+            async with httpx.AsyncClient(timeout=8.0) as c:
+                await c.post(
+                    self._lease_base() + "/lease/release",
+                    params={"holder": self.lease_holder},
+                    headers={"X-Pendant-Secret": self.secret},
+                )
+        except Exception:
+            pass
+
     async def sync(self, *, once: bool = False, max_files: int | None = None) -> None:
+        # Hold the shared drain lease so the desktop and the phone don't drain the
+        # pendant at the same time (and re-upload each other's files).
+        if not await self._lease_acquire():
+            return
+        try:
+            await self._drain(once=once, max_files=max_files)
+        finally:
+            await self._lease_release()
+
+    async def _drain(self, *, once: bool = False, max_files: int | None = None) -> None:
         device = await self._resolve_device()
         connect_target = self._connect_target(device)
         device_label = device.address if isinstance(device, BLEDevice) else device
@@ -203,6 +271,7 @@ class OmiDesktopCollector:
                             LOG.info("uploaded frames=%s; deleting pendant index 0", result.frames)
                             await self.delete_file(client, target, index=0)
                         synced += 1
+                        await self._lease_acquire()  # renew the lease TTL between files
                         if once or (max_files is not None and synced >= max_files):
                             return
 

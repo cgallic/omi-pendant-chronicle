@@ -34,6 +34,10 @@ def build_parser() -> argparse.ArgumentParser:
     sync.add_argument("--once", action="store_true", help="sync one file then exit")
     sync.add_argument("--max-files", type=int, default=None)
     sync.add_argument("--dry-run-delete", action="store_true", help="upload but do not delete pendant files")
+    sync.add_argument("--lease-holder", default=os.environ.get("PENDANT_LEASE_HOLDER"),
+                      help="drain-lease holder id (default: desktop-<hostname>)")
+    sync.add_argument("--no-lease", action="store_true",
+                      help="skip the server-side drain coordination lease")
 
     watch = sub.add_parser("watch", help="periodically scan and sync when the pendant is nearby")
     watch.add_argument("--agent-url", default=os.environ.get("PENDANT_AGENT_URL", "http://127.0.0.1:8773/raw"))
@@ -89,6 +93,8 @@ async def async_main(argv: list[str]) -> int:
             stall_timeout_s=args.stall_timeout,
             storage_ready_timeout_s=args.storage_ready_timeout,
             dry_run_delete=args.dry_run_delete,
+            lease_holder=args.lease_holder,
+            use_lease=not args.no_lease,
         )
         await collector.sync(once=args.once, max_files=args.max_files)
         return 0
