@@ -314,7 +314,11 @@ class OmiDesktopCollector:
                 if len(data) == 1:
                     status = data[0]
                     if status == STORAGE_OK:
-                        continue
+                        # LIST returns exactly one notification (the command acks
+                        # with 0xFF, not 0 — storage.c parse_storage_command), so a
+                        # lone 0 is the firmware's empty-storage response, not an
+                        # ack to keep waiting on. Storage is drained → done.
+                        return []
                     if status == STORAGE_NOT_READY:
                         not_ready = True
                         break
@@ -348,25 +352,37 @@ class OmiDesktopCollector:
 
     async def read_file(self, client: BleakClient, file: StorageFile, *, index: int | None = None) -> bytes:
         read_index = file.index if index is None else index
-        # Like LIST, the READ setup can return STORAGE_NOT_READY(9) while the SD is
-        # busy (full-FS traversal on a large backlog). Retry the whole read while no
-        # bytes have arrived yet; a NOT_READY *after* data has started is a real error.
+        # READ resumes from the current byte offset across retries. The firmware's
+        # single SD worker can return STORAGE_NOT_READY(9) or briefly stall mid-file
+        # when it gets busy (a metadata/allocator write), and BLE can hiccup. Rather
+        # than re-reading the whole file, we re-issue READ from len(buf): the firmware
+        # seeks there (setup_file_transfer start_offset) and streams the remaining
+        # bytes, so partial progress is never thrown away. The long NOT_READY backoff
+        # clears the worker's read_in_flight latch (sd_card.c:1837) before retrying.
         deadline = time.monotonic() + self.storage_ready_timeout_s
-        attempt = 0
+        buf = bytearray()
+        last_log = 0
+        started = time.monotonic()
+        ready_attempt = 0
+        stall_attempt = 0
+        LOG.info("reading index=%s ts=%s size=%s", read_index, file.timestamp, file.size)
         while True:
             self._drain_notifications()
-            cmd = bytes([CMD_READ_FILE, read_index, 0, 0, 0, 0])
+            cmd = bytes([CMD_READ_FILE, read_index]) + len(buf).to_bytes(4, "big")
             await self._write_storage_command(client, cmd)
-
-            buf = bytearray()
-            last_log = 0
-            started = time.monotonic()
-            LOG.info("reading index=%s ts=%s size=%s", read_index, file.timestamp, file.size)
-            not_ready = False
+            pause = 0.0  # seconds to wait before re-issuing READ from the current offset
             while True:
                 try:
                     data = await self._next_notify(self.stall_timeout_s)
                 except asyncio.TimeoutError as exc:
+                    if buf and stall_attempt < 5:
+                        stall_attempt += 1
+                        LOG.info(
+                            "read stalled at %s/%s bytes; resuming from offset (attempt %d)",
+                            len(buf), file.size, stall_attempt,
+                        )
+                        pause = 2.0
+                        break
                     raise StorageProtocolError(
                         f"read stalled index={read_index} bytes={len(buf)}/{file.size}"
                     ) from exc
@@ -385,38 +401,31 @@ class OmiDesktopCollector:
                             (len(buf) / 1024.0) / elapsed,
                         )
                         return bytes(buf)
-                    if status == STORAGE_NOT_READY and not buf:
-                        not_ready = True
+                    if status == STORAGE_NOT_READY:
+                        ready_attempt += 1
+                        pause = min(45.0, 15.0 + 5.0 * ready_attempt)
+                        LOG.info(
+                            "read not ready (SD busy) at %s/%s; retrying from offset in %.0fs (attempt %d)",
+                            len(buf), file.size, pause, ready_attempt,
+                        )
                         break
                     raise StorageProtocolError(f"read status {status_label(status)} index={read_index}")
 
                 if len(data) <= STORAGE_TIMESTAMP_BYTES:
                     continue
                 buf.extend(data[STORAGE_TIMESTAMP_BYTES:])
+                stall_attempt = 0  # made progress → reset the consecutive-stall counter
                 if len(buf) - last_log >= PROGRESS_LOG_BYTES or len(buf) >= file.size:
                     last_log = len(buf)
                     LOG.info("read progress index=%s bytes=%s/%s", read_index, len(buf), file.size)
 
-            if not_ready:
-                if time.monotonic() >= deadline:
-                    raise StorageProtocolError(
-                        f"storage not ready for read index={read_index} after "
-                        f"{self.storage_ready_timeout_s:.0f}s"
-                    )
-                attempt += 1
-                # Back off LONG on read NOT_READY. The firmware serialises all SD
-                # work on one non-preemptible thread with a 60s read semaphore and a
-                # single read_in_flight latch (sd_card.c:1837). Fast (~3s) retries
-                # collide with that 60s window and keep re-arming the latch, so the
-                # read can never land. Wait long enough for the worker to finish its
-                # allocator traversal and clear the latch before asking again.
-                wait = min(45.0, 15.0 + 5.0 * attempt)
-                LOG.info(
-                    "read not ready (SD busy — worker in allocator scan); retrying READ in %.0fs (attempt %d)",
-                    wait,
-                    attempt,
+            if time.monotonic() >= deadline:
+                raise StorageProtocolError(
+                    f"read did not complete index={read_index} bytes={len(buf)}/{file.size} "
+                    f"after {self.storage_ready_timeout_s:.0f}s"
                 )
-                await asyncio.sleep(wait)
+            if pause:
+                await asyncio.sleep(pause)
 
     async def delete_file(self, client: BleakClient, file: StorageFile, *, index: int | None = None) -> None:
         del_index = file.index if index is None else index

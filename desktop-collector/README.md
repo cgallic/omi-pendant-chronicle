@@ -62,6 +62,11 @@ busy:
 - `LIST`, `READ`, and `DELETE` all retry the firmware's `STORAGE_NOT_READY(9)`
   status (the SD/LittleFS worker is momentarily busy) with backoff, bounded by
   `--storage-ready-timeout` (default 90 s).
+- `READ` **resumes from the current byte offset** if it stalls or the worker goes
+  busy mid-file, instead of re-reading the whole file from scratch (the firmware
+  seeks to the requested offset).
+- An empty pendant ends the sync cleanly (a lone `0` from `LIST` is the firmware's
+  empty-storage response), so a no-`--max-files` run terminates when drained.
 - The pendant only advertises **when it is awake** and only accepts **one** BLE
   central at a time — so keep the phone's Bluetooth off (or the app closed) while
   draining from the desktop.
@@ -79,7 +84,8 @@ link. Two things make large-backlog draining reliable:
    allocator pre-warm (`lfs_fs_gc`) once at boot — so the expensive scan happens
    offline before any BLE central connects, and the allocator never re-scans
    mid-drain. Keeping the card drained (well under ~50% full) avoids the pathology
-   entirely.
+   entirely. You can rebuild and flash this firmware **over BLE** (no cable) with
+   `smpmgr` — see `flash-firmware.example.ps1`.
 
 Throughput over BLE is ~60 KB/s on Windows (WinRT + Python) and ~120–175 KB/s
 from a Linux/BlueZ host; the pendant firmware is already tuned (2M PHY, DLE 251).
