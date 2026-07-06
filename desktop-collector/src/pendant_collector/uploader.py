@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import struct
 from dataclasses import dataclass
 from typing import Iterable
@@ -80,13 +81,22 @@ class AgentUploader:
             headers["X-Pendant-Session-Start"] = str(started_at_ms)
 
         body = encode_batch(frames)
-        try:
-            resp = await client.post(self.batch_url, headers=headers, content=body)
-        except Exception as exc:
-            return False, None, f"{type(exc).__name__}: {exc}"
-        if 200 <= resp.status_code < 300:
-            return True, resp.status_code, None
-        return False, resp.status_code, resp.text[:300]
+        last_exc: Exception | None = None
+        for attempt in range(3):
+            try:
+                resp = await client.post(self.batch_url, headers=headers, content=body)
+            except (httpx.RemoteProtocolError, httpx.ConnectError, httpx.ReadError) as exc:
+                # Pooled keep-alive connection can go stale between slow BLE-paced
+                # batches; a fresh attempt clears it without losing the batch.
+                last_exc = exc
+                await asyncio.sleep(0.5 * (attempt + 1))
+                continue
+            except Exception as exc:
+                return False, None, f"{type(exc).__name__}: {exc}"
+            if 200 <= resp.status_code < 300:
+                return True, resp.status_code, None
+            return False, resp.status_code, resp.text[:300]
+        return False, None, f"{type(last_exc).__name__}: {last_exc}"
 
 
 def encode_batch(frames: Iterable[bytes]) -> bytes:
