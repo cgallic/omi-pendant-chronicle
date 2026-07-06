@@ -10,6 +10,7 @@ from dataclasses import dataclass
 import httpx
 from bleak import BleakClient, BleakScanner
 from bleak.backends.device import BLEDevice
+from bleak.exc import BleakError
 
 from . import uuids
 from .uploader import AgentUploader
@@ -41,6 +42,16 @@ WINRT_ARGS = {
     "address_type": "random",
     "use_cached_services": False,
 }
+
+# A hard BLE disconnect mid-LIST/READ used to kill the whole sync() call and
+# abandon whatever file was in flight - the next scheduled run (10 min later)
+# would then find that file gone from the pendant's own storage (live
+# evidence, 2026-07-06: two files disappeared this way, never uploaded, never
+# explicitly deleted by us). Reconnecting immediately, within the same
+# invocation, is the only way to have a shot at catching the file before
+# whatever the pendant does with an abandoned in-flight read.
+MAX_RECONNECT_ATTEMPTS = 3
+RECONNECT_BACKOFF_S = 2.0
 
 
 @dataclass(frozen=True)
@@ -206,90 +217,201 @@ class OmiDesktopCollector:
         finally:
             await self._lease_release()
 
+    async def _open_client(self, connect_target: BLEDevice | str) -> BleakClient:
+        client = BleakClient(
+            connect_target,
+            timeout=self.connect_timeout_s,
+            services=CONNECT_SERVICES,
+            winrt=WINRT_ARGS,
+        )
+        await client.connect()
+        if not client.is_connected:
+            raise RuntimeError("BLE connection failed")
+        await self._best_effort_setup(client)
+        await self._ensure_storage_available(client)
+        await client.start_notify(uuids.STORAGE_WRITE_CHAR, self._on_storage_notify)
+        return client
+
+    async def _reconnect(self, client: BleakClient, connect_target: BLEDevice | str) -> BleakClient:
+        try:
+            if client.is_connected:
+                await client.disconnect()
+        except Exception:
+            pass
+        return await self._open_client(connect_target)
+
     async def _drain(self, *, once: bool = False, max_files: int | None = None) -> None:
         device = await self._resolve_device()
         connect_target = self._connect_target(device)
         device_label = device.address if isinstance(device, BLEDevice) else device
         device_name = device.name if isinstance(device, BLEDevice) else "Omi"
         LOG.info("connecting address=%s name=%s", device_label, device_name)
-        async with BleakClient(
-            connect_target,
-            timeout=self.connect_timeout_s,
-            services=CONNECT_SERVICES,
-            winrt=WINRT_ARGS,
-        ) as client:
-            if not client.is_connected:
-                raise RuntimeError("BLE connection failed")
 
-            await self._best_effort_setup(client)
-            await self._ensure_storage_available(client)
-            await client.start_notify(uuids.STORAGE_WRITE_CHAR, self._on_storage_notify)
-            try:
-                synced = 0
-                while max_files is None or synced < max_files:
-                    # One LIST per batch, not one per file. LIST is a firmware
-                    # directory scan that can trigger a 10-50s full-filesystem
-                    # traversal when LittleFS's allocation window is exhausted
-                    # (sd_card.c:68-76); re-listing before every file paid that
-                    # stall repeatedly and is what made sync feel like it "reads
-                    # all the files before it starts".
-                    files = await self.list_files(client)
-                    if not files:
-                        LOG.info("storage empty; sync complete")
+        client = await self._open_client(connect_target)
+        try:
+            synced = 0
+            while max_files is None or synced < max_files:
+                # One LIST per batch, not one per file. LIST is a firmware
+                # directory scan that can trigger a 10-50s full-filesystem
+                # traversal when LittleFS's allocation window is exhausted
+                # (sd_card.c:68-76); re-listing before every file paid that
+                # stall repeatedly and is what made sync feel like it "reads
+                # all the files before it starts".
+                files, client = await self._list_files_resilient(client, connect_target)
+                if files is None:
+                    LOG.error(
+                        "giving up on this connection after repeated BLE drops during LIST; "
+                        "next scheduled run will retry"
+                    )
+                    return
+                if not files:
+                    LOG.info("storage empty; sync complete")
+                    return
+
+                LOG.info(
+                    "listed %d files in batch; draining oldest-first without re-listing (first size=%s ts=%s)",
+                    len(files),
+                    files[0].size,
+                    files[0].timestamp,
+                )
+                for target in files:
+                    # After each delete the pendant re-indexes, so the oldest
+                    # undrained file is always index 0. Walk our cached
+                    # metadata for timestamps but read/delete index 0. In
+                    # dry-run we never delete, so nothing shifts and we must
+                    # read each file at its original index instead.
+                    read_index = target.index if self.dry_run_delete else 0
+
+                    # A hard BLE disconnect mid-read (observed live: "Not
+                    # connected" from bleak) used to propagate straight out of
+                    # sync() and abandon the file entirely. Live evidence
+                    # (2026-07-06) shows the pendant does not reliably keep an
+                    # interrupted file around for the *next* scheduled run 10
+                    # minutes later - it can be gone by the time we reconnect.
+                    # So the retry has to happen NOW, inside this same
+                    # invocation, not by waiting for the next cron tick.
+                    raw_bytes, client = await self._read_file_resilient(client, connect_target, target, read_index)
+                    if raw_bytes is None:
+                        LOG.error(
+                            "FILE LIKELY LOST: gave up on index=%s size=%s ts=%s after repeated BLE "
+                            "disconnects during read - it may no longer be retrievable from the pendant",
+                            read_index, target.size, target.timestamp,
+                        )
                         return
 
-                    LOG.info(
-                        "listed %d files in batch; draining oldest-first without re-listing (first size=%s ts=%s)",
-                        len(files),
-                        files[0].size,
-                        files[0].timestamp,
-                    )
-                    for target in files:
-                        # After each delete the pendant re-indexes, so the oldest
-                        # undrained file is always index 0. Walk our cached
-                        # metadata for timestamps but read/delete index 0. In
-                        # dry-run we never delete, so nothing shifts and we must
-                        # read each file at its original index instead.
-                        read_index = target.index if self.dry_run_delete else 0
-                        raw_bytes = await self.read_file(client, target, index=read_index)
-                        frames = self.build_storage_frames(raw_bytes)
-                        if not frames and target.size > 0:
-                            raise StorageProtocolError(
-                                f"file produced no frames index={read_index} size={target.size}"
-                            )
+                    frames = self.build_storage_frames(raw_bytes)
+                    if not frames and target.size > 0:
+                        raise StorageProtocolError(
+                            f"file produced no frames index={read_index} size={target.size}"
+                        )
 
-                        LOG.info("file safe index=%s size=%s frames=%s", read_index, target.size, len(frames))
-                        result = await self.uploader.post_frames(frames, started_at_ms=target.started_at_ms)
-                        if not result.ok:
-                            raise StorageProtocolError(
-                                f"upload failed after {result.frames} frames status={result.status_code} error={result.error}"
-                            )
-
-                        if self.dry_run_delete:
-                            LOG.warning("dry-run delete: leaving pendant file index=%s in place", target.index)
-                        else:
-                            LOG.info("uploaded frames=%s; deleting pendant index 0", result.frames)
-                            await self.delete_file(client, target, index=0)
-                        synced += 1
-                        await self._lease_acquire()  # renew the lease TTL between files
-                        if once or (max_files is not None and synced >= max_files):
-                            return
+                    LOG.info("file safe index=%s size=%s frames=%s", read_index, target.size, len(frames))
+                    result = await self.uploader.post_frames(frames, started_at_ms=target.started_at_ms)
+                    if not result.ok:
+                        raise StorageProtocolError(
+                            f"upload failed after {result.frames} frames status={result.status_code} error={result.error}"
+                        )
 
                     if self.dry_run_delete:
-                        # Nothing was deleted, so a re-LIST would return the same
-                        # batch forever. One pass is all dry-run can do.
-                        LOG.info("dry-run: drained one batch of %d files; stopping", len(files))
+                        LOG.warning("dry-run delete: leaving pendant file index=%s in place", target.index)
+                    else:
+                        LOG.info("uploaded frames=%s; deleting pendant index 0", result.frames)
+                        # The upload already succeeded at this point, so a
+                        # failed delete is NOT a data-loss risk (worst case:
+                        # the file gets re-read and re-uploaded next cycle,
+                        # a harmless duplicate) - but it's still worth
+                        # reconnecting to finish the cleanup immediately
+                        # rather than crashing the whole run and waiting for
+                        # the next scheduled tick just to retry a DELETE.
+                        client = await self._delete_file_resilient(client, connect_target, target)
+                    synced += 1
+                    await self._lease_acquire()  # renew the lease TTL between files
+                    if once or (max_files is not None and synced >= max_files):
                         return
-            finally:
-                # Don't let a cleanup call mask the real failure: if the pendant
-                # dropped the link (e.g. its storage worker jammed in an allocator
-                # traversal and starved the BLE stack), stop_notify raises
-                # "Not connected" and hides the underlying disconnect.
+
+                if self.dry_run_delete:
+                    # Nothing was deleted, so a re-LIST would return the same
+                    # batch forever. One pass is all dry-run can do.
+                    LOG.info("dry-run: drained one batch of %d files; stopping", len(files))
+                    return
+        finally:
+            # Don't let a cleanup call mask the real failure: if the pendant
+            # dropped the link (e.g. its storage worker jammed in an allocator
+            # traversal and starved the BLE stack), stop_notify raises
+            # "Not connected" and hides the underlying disconnect.
+            try:
+                if client.is_connected:
+                    await client.stop_notify(uuids.STORAGE_WRITE_CHAR)
+            except Exception as exc:
+                LOG.info("stop_notify skipped (link already down): %s", exc)
+            try:
+                if client.is_connected:
+                    await client.disconnect()
+            except Exception:
+                pass
+
+    async def _list_files_resilient(
+        self, client: BleakClient, connect_target: BLEDevice | str
+    ) -> tuple[list[StorageFile] | None, BleakClient]:
+        for attempt in range(1, MAX_RECONNECT_ATTEMPTS + 1):
+            try:
+                return await self.list_files(client), client
+            except BleakError as exc:
+                LOG.warning(
+                    "BLE disconnected during LIST (attempt %d/%d): %s", attempt, MAX_RECONNECT_ATTEMPTS, exc
+                )
                 try:
-                    if client.is_connected:
-                        await client.stop_notify(uuids.STORAGE_WRITE_CHAR)
-                except Exception as exc:
-                    LOG.info("stop_notify skipped (link already down): %s", exc)
+                    client = await self._reconnect(client, connect_target)
+                except Exception as reconnect_exc:
+                    LOG.warning("reconnect attempt %d failed: %s", attempt, reconnect_exc)
+                    await asyncio.sleep(RECONNECT_BACKOFF_S)
+        return None, client
+
+    async def _read_file_resilient(
+        self,
+        client: BleakClient,
+        connect_target: BLEDevice | str,
+        target: StorageFile,
+        read_index: int,
+    ) -> tuple[bytes | None, BleakClient]:
+        for attempt in range(1, MAX_RECONNECT_ATTEMPTS + 1):
+            try:
+                return await self.read_file(client, target, index=read_index), client
+            except BleakError as exc:
+                LOG.warning(
+                    "BLE disconnected mid-read (index=%s attempt=%d/%d): %s",
+                    read_index, attempt, MAX_RECONNECT_ATTEMPTS, exc,
+                )
+                try:
+                    client = await self._reconnect(client, connect_target)
+                except Exception as reconnect_exc:
+                    LOG.warning("reconnect attempt %d failed: %s", attempt, reconnect_exc)
+                    await asyncio.sleep(RECONNECT_BACKOFF_S)
+        return None, client
+
+    async def _delete_file_resilient(
+        self, client: BleakClient, connect_target: BLEDevice | str, target: StorageFile
+    ) -> BleakClient:
+        for attempt in range(1, MAX_RECONNECT_ATTEMPTS + 1):
+            try:
+                await self.delete_file(client, target, index=0)
+                return client
+            except BleakError as exc:
+                LOG.warning(
+                    "BLE disconnected mid-delete (key=%s attempt=%d/%d): %s",
+                    target.key, attempt, MAX_RECONNECT_ATTEMPTS, exc,
+                )
+                try:
+                    client = await self._reconnect(client, connect_target)
+                except Exception as reconnect_exc:
+                    LOG.warning("reconnect attempt %d failed: %s", attempt, reconnect_exc)
+                    await asyncio.sleep(RECONNECT_BACKOFF_S)
+        LOG.warning(
+            "could not confirm delete of key=%s after repeated disconnects; "
+            "it will be re-read (and safely re-uploaded, since upload already succeeded) next cycle",
+            target.key,
+        )
+        return client
 
     async def _resolve_device(self) -> BLEDevice | str:
         return await self.scan_first(self.address)
@@ -376,8 +498,19 @@ class OmiDesktopCollector:
             self._drain_notifications()
             await self._write_storage_command(client, bytes([CMD_LIST_FILES]))
             not_ready = False
+            stalled = False
             while True:
-                data = await self._next_notify(self.stall_timeout_s)
+                # Unlike read_file's inner loop, this used to have no
+                # try/except around the notify-wait at all - a plain stall
+                # (no NOT_READY status, just no response) raised an uncaught
+                # asyncio.TimeoutError straight out of sync(), identical
+                # end result to the BLE-disconnect bug (whole run dies,
+                # rc=1) but via a different path. Live-observed 2026-07-06.
+                try:
+                    data = await self._next_notify(self.stall_timeout_s)
+                except asyncio.TimeoutError:
+                    stalled = True
+                    break
                 if not data:
                     continue
                 if len(data) == 1:
@@ -404,16 +537,18 @@ class OmiDesktopCollector:
                     offset += 8
                 return estimate_timestamps(files)
 
-            if not_ready:
+            if not_ready or stalled:
                 if time.monotonic() >= deadline:
+                    reason = "storage not ready" if not_ready else "LIST stalled (no response)"
                     raise StorageProtocolError(
-                        f"storage not ready after {self.storage_ready_timeout_s:.0f}s "
-                        "(SD still initializing — retry once the pendant has settled)"
+                        f"{reason} after {self.storage_ready_timeout_s:.0f}s "
+                        "(SD still initializing / firmware unresponsive — retry once the pendant has settled)"
                     )
                 attempt += 1
                 wait = min(3.0, 1.0 + 0.5 * attempt)
                 LOG.info(
-                    "storage not ready (SD initializing); retrying LIST in %.1fs (attempt %d)",
+                    "LIST %s; retrying in %.1fs (attempt %d)",
+                    "not ready (SD initializing)" if not_ready else "stalled (no notification)",
                     wait,
                     attempt,
                 )
@@ -506,8 +641,13 @@ class OmiDesktopCollector:
             self._drain_notifications()
             await self._write_storage_command(client, bytes([CMD_DELETE_FILE, del_index]))
             not_ready = False
+            stalled = False
             while True:
-                data = await self._next_notify(self.stall_timeout_s)
+                try:
+                    data = await self._next_notify(self.stall_timeout_s)
+                except asyncio.TimeoutError:
+                    stalled = True
+                    break
                 if len(data) != 1:
                     continue
                 status = data[0]
@@ -518,15 +658,20 @@ class OmiDesktopCollector:
                     not_ready = True
                     break
                 raise StorageProtocolError(f"delete status {status_label(status)} index={del_index}")
-            if not_ready:
+            if not_ready or stalled:
                 if time.monotonic() >= deadline:
+                    reason = "storage not ready" if not_ready else "DELETE stalled (no response)"
                     raise StorageProtocolError(
-                        f"storage not ready for delete index={del_index} after "
+                        f"{reason} for delete index={del_index} after "
                         f"{self.storage_ready_timeout_s:.0f}s"
                     )
                 attempt += 1
                 wait = min(10.0, 2.0 + 1.0 * attempt)
-                LOG.info("delete not ready (SD busy); retrying DELETE in %.0fs (attempt %d)", wait, attempt)
+                LOG.info(
+                    "DELETE %s; retrying in %.0fs (attempt %d)",
+                    "not ready (SD busy)" if not_ready else "stalled (no notification)",
+                    wait, attempt,
+                )
                 await asyncio.sleep(wait)
 
     def build_storage_frames(self, data: bytes) -> list[bytes]:
