@@ -152,3 +152,8 @@ Based Hardware.
 ## License
 
 MIT — see [LICENSE](LICENSE). Fork it, change anything.
+
+
+---
+
+*Built and maintained by [Connor Gallic](https://pr.linkedin.com/in/cgallic) — connect on LinkedIn.*
